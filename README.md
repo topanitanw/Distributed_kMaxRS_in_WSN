@@ -1,2 +1,2 @@
-# Distributed_kMaxRS_in_WSN
-Distributed kMaxRS in Wireless Sensor Network
+# distributed_kmaxrs_wsn
+Distributedk-MaxRS in Wireless Sensor Network 55555

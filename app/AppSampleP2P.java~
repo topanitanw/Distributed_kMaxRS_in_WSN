@@ -1,0 +1,933 @@
+/*
+ * AppSampleP2P.java
+ *
+ * Created on April 15, 2008, 11:14 AM
+ * 
+ * @author  Oliviu Ghica
+ */
+package sidnet.stack.users.sample_p2p.app;
+
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.Window;
+
+import java.util.Enumeration;
+import java.util.LinkedList;
+import java.util.List;
+import jist.swans.misc.Message; 
+import jist.swans.net.NetInterface; 
+import jist.swans.net.NetAddress; 
+import jist.swans.mac.MacAddress;
+import jist.swans.Constants; 
+import jist.runtime.JistAPI; 
+import sidnet.colorprofiles.ColorProfileGeneric;
+import sidnet.core.gui.TopologyGUI;
+import sidnet.core.interfaces.AppInterface;
+import sidnet.core.interfaces.CallbackInterface;
+import sidnet.core.interfaces.ColorProfile;
+import sidnet.core.misc.Location2D;
+import sidnet.stack.std.routing.heartbeat.MessageHeartbeat;
+import sidnet.stack.std.routing.shortestgeopath.SGPWrapperMessage;
+import sidnet.stack.users.sample_p2p.driver.Driver_SampleP2P;
+import sidnet.stack.users.sample_p2p.experiments.ExperimentData_SD;
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.DictWindow;
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.DistSlabfile;
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.Objects;
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.Target;
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.centralized_kMaxRS;
+import sidnet.stack.users.sample_p2p.kmaxrs_centralized.distributed_kMaxRS;
+// import sidnet.stack.users.sample_p2p.kmaxrs_centralized.Objects;
+import sidnet.core.misc.HierarchicalNode;
+import sidnet.core.misc.Node;
+import sidnet.core.query.Query;
+import sidnet.utilityviews.statscollector.StatEntry_PacketReceivedContor;
+import sidnet.utilityviews.statscollector.StatsCollector;
+import sidnet.core.simcontrol.SimManager;
+import java.util.Random;
+import java.util.Vector;
+
+import com.sun.msv.driver.textui.Driver;
+
+public class AppSampleP2P implements AppInterface, CallbackInterface {
+  private final HierarchicalNode myNode; // The SIDnet handle to the node representation 
+    
+  public static TopologyGUI topologyGUI = null;
+
+  private static final byte TTL = 40;
+  
+  //sink configuration
+	private static NetAddress sinkIP;
+	private static Location2D sinkLocation;
+	public static boolean DEBUG = true;      
+  /** network entity. */ 
+  private NetInterface netEntity;
+    
+  /** self-referencing proxy entity. */
+  private Object self;
+    
+  /** flag to mark if a heartbean protocol has been initialized */
+  private boolean heartbeatInitiated = false;
+    
+  private static boolean flag = false;
+    
+  private boolean signaledUserRequest = false;
+    
+  private final short routingProtocolIndex;
+    
+  private StatsCollector stats = null;
+    
+  private boolean startedSensing = false;
+
+  // normal motes will sampling every 30 seconds, while the principle nodes will
+  // do so every 1 minutes.
+  private static long SAMPLING_INTERVAL = 1 * Constants.SECOND;
+  
+  private static Random ran = new Random();
+  
+  private static int THRESHOLD = 0;
+    
+  private ExperimentData_SD experimentData = null;
+  // do not make this static
+  private ColorProfileGeneric colorProfileGeneric = new ColorProfileGeneric(); 
+    
+  /** Creates a new instance of the AppP2P */
+  public AppSampleP2P(Node myNode, 
+                      short routingProtocolIndex,
+                      StatsCollector stats,
+                      ExperimentData_SD experimentData)
+  {
+    this.self = JistAPI.proxyMany(this, new Class[] { AppInterface.class });
+    this.myNode = (HierarchicalNode) myNode;
+        
+    // To allow the upper layer (user's terminal) 
+    //to signal any updates to this node */
+    this.myNode.setAppCallback(this);
+  
+    this.routingProtocolIndex = routingProtocolIndex;
+    // System.out.println("sampling interval: " + experimentData.getLong(experimentData.SAMPLING_INTERVAL, 10) + " " + Constants.SECOND); 
+    this.stats = stats;
+    this.experimentData = experimentData;
+    this.sinkIP = this.experimentData.sinkIP;
+    this.sinkLocation = this.experimentData.sinkLocation;
+  }
+
+  /* 
+   * This is your main execution loop at the Application Level. Here you design the application functionality. It is simulation-time driven
+   * The first call to this function is made automatically upon starting the simulation, from the Driver
+   */
+  public void run(String[] args) 
+  {   
+    if (myNode.sink_node) myNode.setupObjects(Driver_SampleP2P.nodes);
+    /* At time 0, set the simulation speed to x1000 to get over the heartbeat node identification phase fast */
+    if (JistAPI.getTime() == 0)  // this is how to get the simulation time, by the way
+      myNode.getSimControl().setSpeed(SimManager.X1000);
+     
+    //if (myNode.getID() != 2) return;  // ???
+    /* This is a one-time phase. We'll allow a one-hour warm-up in which each node identifies its neighbors (The Heartbeat Protocol) */
+    if (JistAPI.getTime() > 0 && !heartbeatInitiated)
+    {
+      // System.out.println("["+(myNode.getID() * 5 * Constants.MINUTE) +"] Node " + myNode.getID() + " broadcasts a heartbeat message");
+      // sinkLocation = experimentData.sinkLocation;
+      myNode.getNodeGUI().colorCode.mark(colorProfileGeneric, ColorProfileGeneric.TRANSMIT, 500); 
+               
+      /* To avoid all nodes to transmit in the same time */
+      JistAPI.sleepBlock(myNode.getID() * 5 * Constants.SECOND); 
+                
+      MessageHeartbeat msg = new MessageHeartbeat();
+      msg.setNCS_Location(myNode.getNCS_Location2D());
+                               
+      myNode.getNodeGUI().colorCode.mark(colorProfileGeneric, ColorProfileGeneric.TRANSMIT, 500); 
+                
+      /* Send the heartbeat message. The heartbeat protocol will handle these messages and continue according to the protocol*/
+      netEntity.send(msg, NetAddress.ANY, Constants.NET_PROTOCOL_HEARTBEAT, Constants.NET_PRIORITY_NORMAL, (byte)100);  // TTL 100
+                
+      heartbeatInitiated = true;
+    }
+         
+    /* Wait 1 hour for the heartbeat-bootstrap to finish, then slow down to allow users to interact in real-time*/
+    // increase the speed of the simulation here
+    if (JistAPI.getTime()/Constants.HOUR >= 1 && !flag) {
+      myNode.getSimControl().setSpeed(SimManager.X1);
+      flag = true;
+    }
+          
+    if (JistAPI.getTime()/Constants.MINUTE < 60) {
+      /*if (myNode.getID() == 0)
+        {
+        topologyGUI.addLink(new NCS_Location2D(0,0), new NCS_Location2D(1,1), 0 , Color.blue);
+        topologyGUI.addLink(3, 5, 0, Color.green);
+        }*/
+              
+      JistAPI.sleep(5000*Constants.MILLI_SECOND);  // 5000 milliseconds
+              
+      /* this is to schedule the next run(args) */
+      ((AppInterface)self).run(null);  
+      /* !!! Pay attention to the way we re-run the app-layer code. We don't use a while loop, 
+       * but rather let JiST call this again and again */
+              
+      return;
+    }
+
+    // #Besim code
+    LinkedList params = new LinkedList();
+    params.add(SAMPLING_INTERVAL); // sampling
+    params.add(100 * Constants.HOUR); // duration
+    params.add(1); // queryId
+    params.add(2l); // sequence number
+    params.add(this.experimentData.sinkIP); // some random sink address
+    params.add(this.experimentData.sinkLocation);
+    params.add(myNode.getID());
+    //    sensing(params);
+    ((AppInterface)self).sensing(params);
+  }
+    
+  // #Besim same  
+  public void run() {
+    //Location currentLoc = field.getRadioData(new Integer(nodenum)).getLocation();
+    JistAPI.sleep(2 + (long)((1000-2)*Constants.random.nextFloat())); 
+    run(null);
+  }
+
+  /* Sensing the phenomena is most likely a periodic process. We wrote a procedure to do so.
+   * Since the sensing() takes place at various simulation-time, this function should be called through a proxy reference, rather than directly to avoid
+   * an infinite starvation loop */
+  public void sensing(List params)
+  {
+    long samplingInterval  = (Long)params.get(0);
+    long endTime           = (Long)params.get(1);
+    int  queryId           = (Integer)params.get(2);
+    long sequenceNumber    = (Long)params.get(3);
+    NetAddress sinkAddress = (NetAddress) params.get(4);
+    Location2D sinkLocation= (Location2D) params.get(5);
+    int nodeid = (Integer) params.get(6);
+    // MessageDataValue msgDataValue = (MessageDataValue) params.get(6);
+    // expect that all motes in the cluster will send the data to the
+    // principle node for two times
+    myNode.getNodeGUI().colorCode.mark(colorProfileGeneric, ColorProfileGeneric.SENSE, 5);    
+    double sensedValue = myNode.readAnalogSensorData(0);
+    myNode.getNodeGUI().setUserDefinedData1((int)sensedValue);
+    if (sensedValue <= 0) // the sensed value must be higher than zero.
+      sensedValue = 1;
+    
+    // +++++++++++++++++++++++++ data processing 
+    if (Driver_SampleP2P.centralized) {
+      if (myNode.sink_node) {
+        // delay and process the received data
+        myNode.setObjects(myNode.getID(), 
+                          myNode.getLocation2D().getX(),
+                          myNode.getLocation2D().getY(),
+                          sensedValue);
+        JistAPI.sleepBlock(SAMPLING_INTERVAL * 2 * 50);
+        centralized_kMaxRS.centralized(myNode.getObjects(), Driver_SampleP2P.k);
+      } else
+        JistAPI.sleepBlock(50 * SAMPLING_INTERVAL);
+      
+    } else {
+      
+      if (myNode.sink_node) {
+        JistAPI.sleepBlock(SAMPLING_INTERVAL * 4 * 50);
+      } else if (myNode.cluster_head &&
+                (myNode.cluster_number == (Driver_SampleP2P.number_of_cluster * Driver_SampleP2P.number_of_cluster -1))) 
+      {
+        // if this is the last cluster 
+        myNode.addObjectsv(myNode.getID(), 
+            myNode.getLocation2D().getX(),
+            myNode.getLocation2D().getY(),
+            sensedValue);
+        
+        JistAPI.sleepBlock(SAMPLING_INTERVAL * 4* 50);
+        System.out.println("clus number: " + myNode.cluster_number);
+        // public static DistSlabfile[] distributed(Vector<Objects> obj, int k, DictWindow dic, int cl_id)
+        DistSlabfile[] res = distributed_kMaxRS.distributed_last(myNode.dis_obj, 
+                                                                 Driver_SampleP2P.k, 
+                                                                 null, 
+                                                                 myNode.cluster_number);
+        System.out.println("send the sf to x: " + myNode.upLocation.getX() + " y: " + myNode.upLocation.getY());
+        // queryId = 0 = up
+        MessageSlabFile msgsf = new MessageSlabFile(res[0],
+            0,
+            sequenceNumber,
+            myNode.getID(),
+            nodeid,
+            myNode.getLocation2D());
+        
+        SGPWrapperMessage msgSGP 
+          = new SGPWrapperMessage(msgsf, 
+              myNode.upLocation,
+              0, 
+              JistAPI.getTime());
+      
+        netEntity.send(msgSGP, 
+            myNode.upAddress,
+            routingProtocolIndex,
+            Constants.NET_PRIORITY_NORMAL, 
+            (byte) TTL);        
+
+        // queryId = 1 = next
+        System.out.println("send the sf to x: " + myNode.nextLocation.getX() + " y: " + myNode.nextLocation.getY());
+        msgsf = new MessageSlabFile(res[1],
+            queryId,
+            sequenceNumber,
+            myNode.getID(),
+            nodeid,
+            myNode.getLocation2D());
+        
+        msgSGP = new SGPWrapperMessage(msgsf, 
+            myNode.nextLocation,
+            0, 
+            JistAPI.getTime());
+        
+        netEntity.send(msgSGP, 
+            myNode.nextAddress,
+            routingProtocolIndex,
+            Constants.NET_PRIORITY_NORMAL, 
+            (byte) TTL);
+        this.stats.incrementValue("SEND_PACKET", 2);
+      } else if (myNode.cluster_head) {
+        myNode.addObjectsv(myNode.getID(), 
+            myNode.getLocation2D().getX(),
+            myNode.getLocation2D().getY(),
+            sensedValue);
+        JistAPI.sleepBlock(SAMPLING_INTERVAL * 2 * 50);
+      } else {
+        JistAPI.sleepBlock(SAMPLING_INTERVAL * 1 * 50);
+      }
+    }      
+    
+    System.out.println("sensing Node ID: " + myNode.getID() + " " + myNode.getLocation2D() + " sink_address: " + sinkAddress + " | sensed_val: " + sensedValue);       
+
+    // Prepare the Aggregation Message containing the measurement
+    // ++++++++++++++++++++++++++++ data transmission
+    if (Driver_SampleP2P.centralized) {
+      // send the sensed value from the nodes to the sink
+      if (!myNode.sink_node) {
+        MessageDataValue msgDataValue = new MessageDataValue(sensedValue,
+                                                             queryId,
+                                                             sequenceNumber,
+                                                             myNode.getID(),
+                                                             nodeid,
+                                                             myNode.getLocation2D());
+        
+        // wrap the MessageQuery as a SGP message
+        SGPWrapperMessage msgSGP = new SGPWrapperMessage(msgDataValue, sinkLocation,
+                                  0, JistAPI.getTime());
+        
+        this.stats.incrementValue("SEND_PACKET", 1);
+        netEntity.send(msgSGP, 
+                       sinkAddress,
+                       routingProtocolIndex,
+                       Constants.NET_PRIORITY_NORMAL, 
+                       (byte) TTL);
+      }
+    } else {
+      // +++++++++++++++++++++ send the sensed value to the cluster head
+      if (!myNode.sink_node && !myNode.cluster_head) {
+        this.stats.incrementValue("SEND_PACKET", 1);
+        MessageDataValue msgDataValue = new MessageDataValue(sensedValue,
+                                                             queryId,
+                                                             sequenceNumber,
+                                                             myNode.getID(),
+                                                             nodeid,
+                                                             myNode.getLocation2D());
+        SGPWrapperMessage msgSGP 
+        = new SGPWrapperMessage(msgDataValue, myNode.ch_location,
+                                0, JistAPI.getTime());
+        
+        netEntity.send(msgSGP, 
+                       myNode.ch_address,
+                       routingProtocolIndex,
+                       Constants.NET_PRIORITY_NORMAL, 
+                       (byte) TTL);        
+        this.stats.incrementValue("SEND_PACKET", 1);
+      } 
+    }
+    
+    myNode.getNodeGUI().colorCode.mark(colorProfileGeneric,
+                                       ColorProfileGeneric.TRANSMIT, 
+                                       5);
+    
+    // #Besim same
+    if (JistAPI.getTime() < endTime)
+    {
+      sequenceNumber++;
+                
+      params.set(0, samplingInterval);
+      params.set(1, endTime);
+      params.set(2, queryId);
+      params.set(3, sequenceNumber);
+      params.set(4, sinkAddress);
+      params.set(5, sinkLocation);
+      // params.set(6, msgDataValue);
+      // System.out.println("Sink IP: " + sinkAddress);                
+      // System.out.println("Sink Location: " + sinkLocation);
+      // this is to schedule the next run(args). 
+      // DO NOT use WHILE loops to do this, 
+      // nor call the function directly. Let JiST handle it 
+      ((AppInterface)self).sensing(params);
+    }
+  }
+      
+  /** Callback registered with the terminal,
+   * The terminal will call this function whenever the user posts a new query or just closes the terminal window
+   * <p>
+   * You should inspect the myNode.localTerminalDataSet.getQueryList() to check for new posted queries that your node must act upon
+   * Have a look at the TerminalDataSet.java for the available data that is exchanged between this node and the terminal
+   */
+  // #Besim same
+  public void signalUserRequest()
+  {
+    /* We'll assume that the node through which the user has posted a query becomes a sink node */
+    if (myNode.getQueryList().size() > 0 )
+    {     
+      Query query = ((LinkedList<Query>)myNode.getQueryList()).getLast();
+      myNode.getNodeGUI().colorCode.mark(colorProfileGeneric, ColorProfileGeneric.SINK, ColorProfile.FOREVER); // to make easier to you to see the node you've posted the query through (the sink node)
+          
+      if (!query.isDispatched()) {        
+        myNode.getNodeGUI().colorCode.mark(colorProfileGeneric, ColorProfileGeneric.SINK, ColorProfileGeneric.FOREVER);
+                
+        int[] rootIDArray = new int[1];
+        rootIDArray[0] = myNode.getID();
+                
+        MessageQuery msgQuery = new MessageQuery(query);
+
+        // wrap the MessageQuery as a SGP message
+        SGPWrapperMessage msgSGP 
+          = new SGPWrapperMessage(msgQuery, query.getRegion(),
+                                  0, JistAPI.getTime());
+                
+        netEntity.send(msgSGP, 
+                       null /*unknown Dest IP, only its approx location*/,
+                       routingProtocolIndex /* (see Driver) */,
+                       Constants.NET_PRIORITY_NORMAL, (byte)100);                  
+                            
+        query.dispatched(true);
+      }
+    }
+  }
+    
+  /**
+   * Message has been received. 
+   * This node must be the either the sink or the source nodes 
+   */
+  public void receive(Message msg, NetAddress src, MacAddress lastHop, byte macId, NetAddress dst, byte priority, byte ttl) 
+  {
+    if (msg == null)
+      return;
+    
+    if (myNode.getEnergyManagement().getBattery().getPercentageEnergyLevel() < 5)
+      return;
+    
+    this.stats.incrementValue("RECEIVE_PACKET", 1);
+    if (msg instanceof MessageTarget) {
+      System.out.println("\n\n -------------- sink received target ---------------------- \n\n");
+    }
+    
+    MessageSlabFile msgsf_tx = null;
+    SGPWrapperMessage msgSGP_tx = null;
+    DistSlabfile dsf = null;
+    
+    if (msg instanceof MessageSlabFile) { 
+      /* This is a source node. It receives the query request, and not it prepares to do the periodic sensing/sampling */
+      MessageSlabFile msgsf = (MessageSlabFile)msg;
+      System.out.println("msg source id: " + ((MessageSlabFile)msg).sourceNodeId + 
+          " node id: " + myNode.getID() + 
+          " node cluster: " + myNode.cluster_number);
+      System.out.println("cluster sink: " + Driver_SampleP2P.cluster_sink + " cluster number: " + myNode.cluster_number);
+      
+      if (myNode.cluster_number == Driver_SampleP2P.cluster_sink) {
+        myNode.sf_count += 1;
+        // System.out.println("yes");
+        if (myNode.sf_count == 1) {
+          // System.out.println("111 dis_sf: " + msgsf.dist_sf);
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+        } else if (myNode.sf_count == 2) {
+          // System.out.println("222 dis_sf: " + msgsf.dist_sf);          
+          myNode.sf_count = 0;
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+          Target tar = distributed_kMaxRS.distributed_sink_pkt(myNode.dis_obj, 
+                                                  Driver_SampleP2P.k, 
+                                                  myNode.dis_sf_up,
+                                                  myNode.dis_sf_next,
+                                                  myNode.cluster_number);
+          // send the message to the sink node
+          // remember that the principle node in the same cluster as sink
+          // will save the sink address in the upAddress
+          MessageTarget msgtar_tx = new MessageTarget(tar,
+                                                      0,
+                                                      0,
+                                                      myNode.getID(),
+                                                      myNode.getID(),
+                                                      myNode.getLocation2D());
+
+          msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                           myNode.upLocation,
+                           0,
+                           JistAPI.getTime());
+
+          netEntity.send(msgSGP_tx, 
+                        myNode.upAddress,
+                        routingProtocolIndex,
+                        Constants.NET_PRIORITY_NORMAL, 
+                        (byte) TTL); 
+          this.stats.incrementValue("SEND_PACKET", 1);
+        }
+      } else if ((myNode.cluster_number == (Driver_SampleP2P.number_of_cluster - 1)) ||
+                 (myNode.cluster_number == (Driver_SampleP2P.number_of_cluster - 1) * 
+                                           (Driver_SampleP2P.number_of_cluster))) 
+      {
+        //  0  1 "2"  
+        //  3  4  5
+        // "6" 7  8 
+        // handle the corner cases such as 2 and 6 in the 3 x 3 cluster
+        dsf = distributed_kMaxRS.distributed_one_pkt(myNode.dis_obj, 
+                                                     Driver_SampleP2P.k,
+                                                     msgsf.dist_sf,
+                                                     myNode.cluster_number);
+        
+        System.out.println("node id: " + myNode.getID());
+        System.out.println("send the sf to x: " + myNode.nextLocation.getX() + " y: " + myNode.nextLocation.getY());
+        
+        msgsf_tx = new MessageSlabFile(dsf,
+                                       0,
+                                       0,
+                                       myNode.getID(),
+                                       myNode.getID(),
+                                       myNode.getLocation2D());
+
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                                          myNode.nextLocation,
+                                          0,
+                                          JistAPI.getTime());
+        
+        netEntity.send(msgSGP_tx, 
+                       myNode.nextAddress, 
+                       routingProtocolIndex, 
+                       Constants.NET_PRIORITY_NORMAL, 
+                       (byte) TTL); 
+        this.stats.incrementValue("SEND_PACKET", 1);
+      } else if (myNode.cluster_number < Driver_SampleP2P.number_of_cluster) {
+        // 0 1 2 <- 
+        // 3 4 5
+        // 6 7 8 
+        // the first row 
+        myNode.sf_count += 1;
+        // System.out.println("yes");
+        if (myNode.sf_count == 1) {
+          // System.out.println("111 dis_sf: " + msgsf.dist_sf);
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+        } else if (myNode.sf_count == 2) {
+          // System.out.println("222 dis_sf: " + msgsf.dist_sf);          
+          myNode.sf_count = 0;
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+          dsf = distributed_kMaxRS.distributed_rx2_tx1(myNode.dis_obj, 
+                                                       Driver_SampleP2P.k, 
+                                                       myNode.dis_sf_up,
+                                                       myNode.dis_sf_next,
+                                                       myNode.cluster_number);
+          // send the message to the sink node
+          // remember that the principle node in the same cluster as sink
+          // will save the sink address in the upAddress
+          msgsf_tx = new MessageSlabFile(dsf,
+                                        0,
+                                        0,
+                                        myNode.getID(),
+                                        myNode.getID(),
+                                        myNode.getLocation2D());
+
+          msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                           myNode.nextLocation,
+                           0,
+                           JistAPI.getTime());
+
+          netEntity.send(msgSGP_tx, 
+                        myNode.nextAddress,
+                        routingProtocolIndex,
+                        Constants.NET_PRIORITY_NORMAL, 
+                        (byte) TTL); 
+          this.stats.incrementValue("SEND_PACKET", 1);
+        }       
+      } else if ((myNode.cluster_number > (Driver_SampleP2P.number_of_cluster - 1) * Driver_SampleP2P.number_of_cluster) && 
+                 (myNode.cluster_number < Driver_SampleP2P.number_of_cluster * Driver_SampleP2P.number_of_cluster))
+      {
+        // 0 1 2
+        // 3 4 5
+        // 6 7 8 <- the last row
+        myNode.sf_count += 1;
+        // System.out.println("yes");
+        if (myNode.sf_count == 1) {
+          // System.out.println("111 dis_sf: " + msgsf.dist_sf);
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+        } else if (myNode.sf_count == 2) {
+          // System.out.println("222 dis_sf: " + msgsf.dist_sf);          
+          myNode.sf_count = 0;
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+          DistSlabfile[] dsf_two = distributed_kMaxRS.distributed_rx1_tx2(myNode.dis_obj, 
+                                                                          Driver_SampleP2P.k,
+                                                                          msgsf.dist_sf,                                                     
+                                                                          myNode.cluster_number);
+
+          msgsf_tx = new MessageSlabFile(dsf_two[0],
+              0,
+              0,
+              myNode.getID(),
+              myNode.getID(),
+              myNode.getLocation2D());
+    
+          msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+              myNode.upLocation,
+              0,
+              JistAPI.getTime());
+            
+          netEntity.send(msgSGP_tx, 
+              myNode.upAddress,
+              routingProtocolIndex,
+              Constants.NET_PRIORITY_NORMAL, 
+              (byte) TTL);
+          
+          msgsf_tx = new MessageSlabFile(dsf_two[1],
+              0,
+              0,
+              myNode.getID(),
+              myNode.getID(),
+              myNode.getLocation2D());
+    
+          msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+              myNode.nextLocation,
+              0,
+              JistAPI.getTime());
+            
+          netEntity.send(msgSGP_tx, 
+              myNode.nextAddress,
+              routingProtocolIndex,
+              Constants.NET_PRIORITY_NORMAL, 
+              (byte) TTL);
+
+          this.stats.incrementValue("SEND_PACKET", 1);
+        }        
+      } else if (myNode.cluster_number/Driver_SampleP2P.number_of_cluster >=1)
+      {
+        // 0 1 2 
+        // 3 4 5
+        // 6 7 8 
+        // ^  
+        // cluster on the left most column
+        myNode.sf_count += 1;
+        // System.out.println("yes");
+        if (myNode.sf_count == 1) {
+          // System.out.println("111 dis_sf: " + msgsf.dist_sf);
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);
+        } else if (myNode.sf_count == 2) {
+          // System.out.println("222 dis_sf: " + msgsf.dist_sf);          
+          myNode.sf_count = 0;
+          save_message(msgsf.dist_sf, msgsf.sourceLocation);        
+          dsf = distributed_kMaxRS.distributed_rx2_tx1(myNode.dis_obj, 
+                                                       Driver_SampleP2P.k,
+                                                       myNode.dis_sf_up,
+                                                       myNode.dis_sf_next,
+                                                       myNode.cluster_number);          
+
+          System.out.println("send the sf to x: " + myNode.upLocation.getX() + " y: " + myNode.upLocation.getY());
+
+          msgsf_tx = new MessageSlabFile(dsf,
+                                      0,
+                                      0,
+                                      myNode.getID(),
+                                      myNode.getID(),
+                                      myNode.getLocation2D());
+          
+          msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                                            myNode.upLocation,
+                                            0,
+                                            JistAPI.getTime());
+          netEntity.send(msgSGP_tx, 
+              myNode.upAddress,
+              routingProtocolIndex,
+              Constants.NET_PRIORITY_NORMAL, 
+              (byte) TTL); 
+
+          this.stats.incrementValue("SEND_PACKET", 1);
+        }
+      } else if ((myNode.cluster_number + 1)/Driver_SampleP2P.number_of_cluster >= 1) {
+        // 0 1 2  
+        // 3 4 5
+        // 6 7 8 
+        //     ^  
+        // the right column
+        DistSlabfile[] dsf_two = distributed_kMaxRS.distributed_rx1_tx2(myNode.dis_obj, 
+                                                                         Driver_SampleP2P.k,
+                                                                         msgsf.dist_sf,
+                                                                         myNode.cluster_number);
+        
+        System.out.println("node id: " + myNode.getID());
+        System.out.println("send the sf to x: " + myNode.nextLocation.getX() + " y: " + myNode.nextLocation.getY());
+        
+        msgsf_tx = new MessageSlabFile(dsf_two[0],
+                                       0,
+                                       0,
+                                       myNode.getID(),
+                                       myNode.getID(),
+                                       myNode.getLocation2D());
+
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                                          myNode.upLocation,
+                                          0,
+                                          JistAPI.getTime());
+        
+        netEntity.send(msgSGP_tx, 
+                       myNode.upAddress, 
+                       routingProtocolIndex, 
+                       Constants.NET_PRIORITY_NORMAL, 
+                       (byte) TTL); 
+
+        msgsf_tx = new MessageSlabFile(dsf_two[1],
+                               0,
+                               0,
+                               myNode.getID(),
+                               myNode.getID(),
+                               myNode.getLocation2D());
+
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                                          myNode.nextLocation,
+                                          0,
+                                          JistAPI.getTime());
+        
+        netEntity.send(msgSGP_tx, 
+                       myNode.nextAddress, 
+                       routingProtocolIndex, 
+                       Constants.NET_PRIORITY_NORMAL, 
+                       (byte) TTL); 
+
+        this.stats.incrementValue("SEND_PACKET", 2);     
+      } else if ((Driver_SampleP2P.number_of_cluster * (Driver_SampleP2P.number_of_cluster - 1) < myNode.cluster_number) ||
+                 (myNode.cluster_number < Driver_SampleP2P.number_of_cluster * Driver_SampleP2P.number_of_cluster)) {
+
+        DistSlabfile[] dsf_two = distributed_kMaxRS.distributed_rx1_tx2(myNode.dis_obj, 
+                                                                         Driver_SampleP2P.k,
+                                                                         msgsf.dist_sf,
+                                                                         myNode.cluster_number);
+        msgsf_tx = new MessageSlabFile(dsf_two[0],
+            0,
+            0,
+            myNode.getID(),
+            myNode.getID(),
+            myNode.getLocation2D());
+  
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+            myNode.upLocation,
+            0,
+            JistAPI.getTime());
+          
+        netEntity.send(msgSGP_tx, 
+            myNode.upAddress,
+            routingProtocolIndex,
+            Constants.NET_PRIORITY_NORMAL, 
+            (byte) TTL);
+        
+        msgsf_tx = new MessageSlabFile(dsf_two[1],
+            0,
+            0,
+            myNode.getID(),
+            myNode.getID(),
+            myNode.getLocation2D());
+  
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+            myNode.nextLocation,
+            0,
+            JistAPI.getTime());
+          
+        netEntity.send(msgSGP_tx, 
+            myNode.nextAddress,
+            routingProtocolIndex,
+            Constants.NET_PRIORITY_NORMAL, 
+            (byte) TTL);
+        this.stats.incrementValue("SEND_PACKET", 2);        
+    } else {
+      // 0 1 2
+      // 3 4 5 
+      // 6 7 8 
+      // if other principle nodes are the inner clusters such as 4
+      // TODO
+      myNode.sf_count += 1;
+      // System.out.println("yes");
+      if (myNode.sf_count == 1) {
+        // System.out.println("111 dis_sf: " + msgsf.dist_sf);
+        save_message(msgsf.dist_sf, msgsf.sourceLocation);
+      } else if (myNode.sf_count == 2) {
+        save_message(msgsf.dist_sf, msgsf.sourceLocation);
+        DistSlabfile[] dsf_two = distributed_kMaxRS.distributed_inner_two_pkt(myNode.dis_obj, 
+                                                                              Driver_SampleP2P.k,
+                                                                              myNode.dis_sf_up,
+                                                                              myNode.dis_sf_next,                                                     
+                                                                              myNode.cluster_number);
+        msgsf_tx = new MessageSlabFile(dsf_two[0],
+            0,
+            0,
+            myNode.getID(),
+            myNode.getID(),
+            myNode.getLocation2D());
+  
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+            myNode.upLocation,
+            0,
+            JistAPI.getTime());
+          
+        netEntity.send(msgSGP_tx, 
+            myNode.upAddress,
+            routingProtocolIndex,
+            Constants.NET_PRIORITY_NORMAL, 
+            (byte) TTL);
+        
+        msgsf_tx = new MessageSlabFile(dsf_two[1],
+            0,
+            0,
+            myNode.getID(),
+            myNode.getID(),
+            myNode.getLocation2D());
+  
+        msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+            myNode.nextLocation,
+            0,
+            JistAPI.getTime());
+          
+        netEntity.send(msgSGP_tx, 
+            myNode.nextAddress,
+            routingProtocolIndex,
+            Constants.NET_PRIORITY_NORMAL, 
+            (byte) TTL);
+        this.stats.incrementValue("SEND_PACKET", 2);
+        }      
+      }
+    } // if (msg instanceof MessageSlabFile)
+        
+    if (msg instanceof MessageDataValue) 
+    {
+      MessageDataValue msgData = (MessageDataValue)msg;
+      stats.incrementValue("MESSAGE_HOPS", TTL - ttl);
+      this.stats.incrementValue("SINK_RECEIVED", 1); 
+      if (Driver_SampleP2P.centralized) {
+        if (myNode.sink_node) {          
+          if (DEBUG) {
+            System.out.println("receive: Sink val: " + msgData.dataValue + " node id: " + msgData.sourceNodeId);
+            System.out.println("receive: Sink source location: " + msgData.sourceLocation);
+          }
+          myNode.setupObjects(Driver_SampleP2P.nodes);
+          myNode.setObjects(msgData.sourceNodeId, 
+                            msgData.sourceLocation.getX(), 
+                            msgData.sourceLocation.getY(),
+                            msgData.dataValue);
+        } else {
+          if (DEBUG) {
+            System.out.println("receive: src id: " + msgData.sourceNodeId + " : pro id: " 
+                               + msgData.producerNodeId + " val: " + msgData.dataValue);
+          }
+        }
+      } else {
+        if (myNode.cluster_head) {
+          myNode.addObjectsv(msgData.sourceNodeId, 
+                             msgData.sourceLocation.getX(), 
+                             msgData.sourceLocation.getY(), 
+                             msgData.dataValue);
+          System.out.println("receive: cluster: " + myNode.cluster_number + 
+              " node id: " + myNode.getID() +
+              " src id: " + msgData.sourceNodeId + 
+              " pro id: " + msgData.producerNodeId + " val: " + msgData.dataValue);
+        } 
+      }
+      // stats.markPacketReceived("DATA", msgData.sequenceNumber);
+      myNode.getNodeGUI().setUserDefinedData2((int)msgData.sequenceNumber);
+             
+      // Connecting a terminal to this node, at run time,
+      // allows the user to visualize the result of the posted query 
+      myNode.getNodeGUI()
+        .getTerminal()
+        .appendConsoleText(myNode.getNodeGUI().localTerminalDataSet,
+                           "Sample #" +
+                           msgData.sequenceNumber + " | val: " + msgData.dataValue);             
+    }
+  }
+ 
+  /* **************************************** *
+   * Helper functions                         *
+   * **************************************** */
+  public void send_dist_slapfile(DistSlabfile dsf, Location2D dst_loc, NetAddress dst_na, int net_id) {
+    MessageSlabFile msgsf_tx = new MessageSlabFile(dsf,
+                                                   0,
+                                                   0,
+                                                   net_id,
+                                                   net_id,
+                                                   dst_loc);
+    
+    SGPWrapperMessage msgSGP_tx = new SGPWrapperMessage(msgsf_tx,
+                                                        dst_loc,
+                                                        0,
+                                                        JistAPI.getTime());
+    netEntity.send(msgSGP_tx,
+        dst_na,
+        routingProtocolIndex,
+        Constants.NET_PRIORITY_NORMAL,
+        (byte) TTL);     
+  }
+  
+  private int location2cluster(Location2D loc) {
+    int cluster_size = Driver_SampleP2P.fieldLength/Driver_SampleP2P.number_of_cluster;
+    int x = (int) loc.getX()/cluster_size;
+    if (x == Driver_SampleP2P.number_of_cluster) x = x - 1;
+    int y = (int) loc.getY()/cluster_size;
+    if (y == Driver_SampleP2P.number_of_cluster) y = y - 1;
+    return y*Driver_SampleP2P.number_of_cluster + x;
+  }
+  
+  private void save_message(DistSlabfile sf, Location2D src_loc) {
+    // source cluster number
+    int src_sn = location2cluster(src_loc);
+    System.out.print("cluster: " + src_sn + " x : " + src_loc.getX() + " y: " + src_loc.getY());
+    if (src_sn < Driver_SampleP2P.number_of_cluster) {
+      // the first row 
+      System.out.println("save next");
+      myNode.dis_sf_next = sf;
+      return;
+    }
+    
+    if (src_sn%Driver_SampleP2P.number_of_cluster == 0) {
+      System.out.println("save up");
+      myNode.dis_sf_up = sf;
+      return;
+    }
+    
+    if ((((Driver_SampleP2P.number_of_cluster -1 ) * Driver_SampleP2P.number_of_cluster) <= src_sn)
+        && (src_sn <= Driver_SampleP2P.number_of_cluster * Driver_SampleP2P.number_of_cluster)) {
+      // last row 
+      System.out.println("save next");
+      myNode.dis_sf_next = sf;
+      return;
+    }
+    
+    if (src_sn == myNode.cluster_number + Driver_SampleP2P.number_of_cluster) {
+      // from the below cluster to the upper cluster
+      System.out.println("save up");
+      myNode.dis_sf_up = sf;
+    }
+  }
+  
+  /* *****************************************
+   * SWANS network's stack hook-up interfaces *
+   * **************************************** */
+    
+  /**
+   * Set network entity.
+   *
+   * @param netEntity network entity
+   */
+  // #Besim same
+  public void setNetEntity(NetInterface netEntity) {
+    this.netEntity = netEntity;
+  } 
+    
+  /**
+   * Return self-referencing APPLICATION proxy entity.
+   *
+   * @return self-referencing APPLICATION proxy entity
+   */
+  // #Besim same   
+  public AppInterface getAppProxy() {
+    return (AppInterface)self;
+  } 
+}
